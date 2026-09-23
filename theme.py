@@ -40,6 +40,10 @@ DEFAULT_SETTINGS = {
     "minimize_to_tray": True,
     "close_to_tray": False,
     "hotkey_enabled": True,
+    "reminder_enabled": True,
+    "auto_repeat": True,
+    "auto_backup": True,
+    "backup_keep": 10,
 }
 
 BOOL_SETTINGS = (
@@ -50,7 +54,12 @@ BOOL_SETTINGS = (
     "minimize_to_tray",
     "close_to_tray",
     "hotkey_enabled",
+    "reminder_enabled",
+    "auto_repeat",
+    "auto_backup",
 )
+
+BACKUP_KEEP_CHOICES = (5, 10, 20, 50)
 
 LIGHT = {
     "topbar": "#ffffff",
@@ -225,6 +234,11 @@ class Settings:
         except (TypeError, ValueError):
             size = DEFAULT_SETTINGS["font_size"]
         self.data["font_size"] = size if size in FONT_SIZES else DEFAULT_SETTINGS["font_size"]
+        try:
+            keep = int(self.data.get("backup_keep", DEFAULT_SETTINGS["backup_keep"]))
+        except (TypeError, ValueError):
+            keep = DEFAULT_SETTINGS["backup_keep"]
+        self.data["backup_keep"] = keep if keep in BACKUP_KEEP_CHOICES else DEFAULT_SETTINGS["backup_keep"]
         for key in BOOL_SETTINGS:
             self.data[key] = bool(self.data.get(key, DEFAULT_SETTINGS[key]))
         if not isinstance(self.data.get("geometry"), str):

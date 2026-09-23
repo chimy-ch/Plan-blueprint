@@ -19,6 +19,7 @@ import ctypes
 import os
 import sys
 import threading
+import time
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -70,6 +71,10 @@ LPARAM = ctypes.c_ssize_t
 
 WM_ACTIVATE = WM_APP + 3
 TRAY_WINDOW_CLASS = "BlueprintTrayWindow"
+ACTIVATE_EVENT = "Local\\BlueprintBlueprint.Activate"
+EVENT_MODIFY_STATE = 0x0002
+SYNCHRONIZE = 0x00100000
+WAIT_OBJECT_0 = 0
 
 HOTKEY_LABEL = "Ctrl+Alt+J"
 
@@ -149,6 +154,19 @@ if IS_WINDOWS:
     shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
                                           ctypes.POINTER(NOTIFYICONDATAW)]
 
+    kernel32.CreateEventW.restype = wintypes.HANDLE
+    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                      wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.OpenEventW.restype = wintypes.HANDLE
+    kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                    wintypes.LPCWSTR]
+    kernel32.SetEvent.restype = wintypes.BOOL
+    kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
 
 def foreground_window() -> int:
     """返回前台窗口句柄（非 Windows 返回 0）。"""
@@ -185,16 +203,62 @@ def tray_window_exists() -> bool:
         return False
 
 
-def wake_existing_instance() -> bool:
-    """请求已运行的实例把主窗口显示到前台。"""
-    hwnd = _find_tray_window()
-    if not hwnd:
+def _has_visible_window(pid: int) -> bool:
+    """指定进程当前是否有可见的顶层窗口。"""
+    if not IS_WINDOWS or not pid:
         return False
+    state = {"found": False}
+    callback_type = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def _callback(hwnd, _lparam):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd):
+            state["found"] = True
+            return False
+        return True
+
     try:
-        user32.PostMessageW(hwnd, WM_ACTIVATE, 0, 0)
+        user32.EnumWindows(callback_type(_callback), 0)
     except OSError:
         return False
-    return True
+    return bool(state["found"])
+
+
+def _signal_activate() -> bool:
+    """通过命名事件唤醒已有实例（不依赖窗口是否存在）。"""
+    handle = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, ACTIVATE_EVENT)
+    if not handle:
+        return False
+    try:
+        return bool(kernel32.SetEvent(handle))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def wake_existing_instance(wait: float = 2.5) -> bool:
+    """请求已运行的实例把主窗口显示到前台。
+
+    单纯 PostMessage 一次并不可靠（消息可能被丢弃，或窗口查找落在刚退出的
+    进程上），因此这里优先用命名事件通知，并轮询确认窗口确实已经可见，
+    确认成功才返回 True。
+    """
+    if not IS_WINDOWS:
+        return False
+    hwnd = _find_tray_window()
+    signalled = _signal_activate()
+    if not signalled:
+        return False
+    pid = window_process_id(hwnd) if hwnd else 0
+    deadline = time.monotonic() + wait
+    while True:
+        time.sleep(0.2)
+        if pid and _has_visible_window(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        _signal_activate()
 
 
 class TrayService:
@@ -218,6 +282,10 @@ class TrayService:
         self.hotkey_error = 0
 
         self.activate_event = threading.Event()
+        self._activate_handle = None
+        if IS_WINDOWS:
+            self._activate_handle = kernel32.CreateEventW(
+                None, False, False, ACTIVATE_EVENT)
 
         self._thread: threading.Thread | None = None
         self._hwnd = None
@@ -245,9 +313,23 @@ class TrayService:
         if self._hwnd:
             user32.PostMessageW(self._hwnd, WM_CLOSE, 0, 0)
         if self._thread is None:
+            self._release_activate()
             return True
         self._thread.join(timeout=timeout)
+        self._release_activate()
         return not self._thread.is_alive()
+
+    def consume_activate(self) -> bool:
+        """是否收到了「唤醒已有窗口」的请求（命名事件通道）。"""
+        if not self._activate_handle:
+            return False
+        return kernel32.WaitForSingleObject(
+            self._activate_handle, 0) == WAIT_OBJECT_0
+
+    def _release_activate(self) -> None:
+        if self._activate_handle:
+            kernel32.CloseHandle(self._activate_handle)
+            self._activate_handle = None
 
     def notify(self, title: str, text: str) -> None:
         """在弹出的气泡提示中显示一句话（失败静默忽略）。"""

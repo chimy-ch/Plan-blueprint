@@ -11,10 +11,12 @@
 
 from __future__ import annotations
 
+import calendar
 import os
+import sqlite3
 import time
 import tkinter as tk
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
 
 import db
@@ -23,7 +25,14 @@ import single_instance
 import startup
 import tray as tray_mod
 import winicon
-from theme import ACCENTS, FONT_SIZES, THEME_LABELS, Settings, build_palette
+from theme import (
+    ACCENTS,
+    BACKUP_KEEP_CHOICES,
+    FONT_SIZES,
+    THEME_LABELS,
+    Settings,
+    build_palette,
+)
 from widgets import CalendarDateEntry
 
 APP_NAME = "蓝图 Blueprint"
@@ -64,6 +73,13 @@ class PlanFlowApp:
         self._tray_tip_shown = False
         self._poll_job: str | None = None
         self._hotkey_state = bool(self.settings.get("hotkey_enabled"))
+        self._reminder_job: str | None = None
+        self._repeat_guard = False
+        self._undo_plan_id: int | None = None
+        self._cal_year = date.today().year
+        self._cal_month = date.today().month
+        self._cal_selected = date.today().isoformat()
+        self.trash_dialog: "TrashDialog | None" = None
 
         self.font_size = int(self.settings.get("font_size", 10))
         self.colors = build_palette(self.settings.get("theme"), self.settings.get("accent"))
@@ -80,8 +96,15 @@ class PlanFlowApp:
         self._bind_shortcuts()
         self.refresh_all()
         self._init_tray()
+        self.root.after(1200, self._startup_tasks)
         if start_hidden:
             self.root.after(500, lambda: self.hide_to_tray(notify=False))
+
+    def _startup_tasks(self) -> None:
+        """启动后台任务：自动备份 + 到期提醒轮询。"""
+        self._auto_backup()
+        self._check_reminders()
+        self._schedule_reminder()
 
     def _configure_root(self) -> None:
         c = self.colors
@@ -394,8 +417,23 @@ class PlanFlowApp:
         self.root.bind("<Control-s>", lambda _e: self.save_plan())
         self.root.bind("<F5>", lambda _e: self.refresh_all())
         self.root.bind("<Control-comma>", lambda _e: self.open_settings())
+        self.root.bind("<Control-z>", lambda _e: self.undo_delete())
+        self.root.bind("<Control-f>", lambda _e: self._focus_search())
         self.root.bind("<Unmap>", self._on_unmap)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _focus_search(self) -> None:
+        self.nb.select(self.plans_tab)
+        self.search_entry.focus_set()
+        self.search_entry.select_range(0, "end")
+
+    def _stop_reminder(self) -> None:
+        if self._reminder_job is not None:
+            try:
+                self.root.after_cancel(self._reminder_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._reminder_job = None
 
     def on_close(self) -> None:
         if self.settings.get("close_to_tray", False) and not self._quitting:
@@ -403,6 +441,7 @@ class PlanFlowApp:
             self.set_status("已最小化到托盘继续运行 · 托盘图标右键可退出")
             return
         self._quitting = True
+        self._stop_reminder()
         if self.settings.get("remember_geometry"):
             try:
                 self.settings.set("geometry", self.root.geometry())
@@ -436,23 +475,26 @@ class PlanFlowApp:
     def _poll_tray(self) -> None:
         service = self.tray
         if service is not None:
-            if service.hotkey_event.is_set():
-                service.hotkey_event.clear()
-                self.toggle_window()
-            if service.open_event.is_set():
-                service.open_event.clear()
-                self.show_window()
-            if service.activate_event.is_set():
-                service.activate_event.clear()
-                self.show_window()
-            if service.hide_event.is_set():
-                service.hide_event.clear()
-                self.hide_to_tray()
-            if service.quit_event.is_set():
-                service.quit_event.clear()
-                self.request_quit()
-            if service.started.is_set() and not self._tray_reported:
-                self._report_tray()
+            try:
+                if service.hotkey_event.is_set():
+                    service.hotkey_event.clear()
+                    self.toggle_window()
+                if service.open_event.is_set():
+                    service.open_event.clear()
+                    self.show_window()
+                if service.activate_event.is_set() or service.consume_activate():
+                    service.activate_event.clear()
+                    self.show_window()
+                if service.hide_event.is_set():
+                    service.hide_event.clear()
+                    self.hide_to_tray()
+                if service.quit_event.is_set():
+                    service.quit_event.clear()
+                    self.request_quit()
+                if service.started.is_set() and not self._tray_reported:
+                    self._report_tray()
+            except tk.TclError:
+                pass
         self._schedule_poll()
 
     def _report_tray(self) -> None:
@@ -558,6 +600,96 @@ class PlanFlowApp:
         self._quitting = True
         self.on_close()
 
+    # ==================================================================
+    # 到期提醒
+    # ==================================================================
+    def _schedule_reminder(self) -> None:
+        self._stop_reminder()
+        try:
+            self._reminder_job = self.root.after(60_000, self._reminder_tick)
+        except tk.TclError:
+            self._reminder_job = None
+
+    def _reminder_tick(self) -> None:
+        try:
+            self._check_reminders()
+        except Exception:
+            pass
+        finally:
+            self._schedule_reminder()
+
+    def _check_reminders(self) -> list[str]:
+        """检查到期计划，弹出托盘气泡提醒并返回提醒文案。"""
+        if not self.settings.get("reminder_enabled", True):
+            return []
+        today = date.today()
+        today_iso = today.isoformat()
+        messages: list[str] = []
+        for row in self.db.reminder_candidates():
+            due = row["due_date"]
+            try:
+                due_day = date.fromisoformat(str(due)[:10])
+            except ValueError:
+                continue
+            days = (due_day - today).days
+            if days > int(row["remind_days"]):
+                continue
+            if days < 0:
+                if (row["notified_at"] or "") == today_iso:
+                    continue
+            elif (row["notified_at"] or "") == due:
+                continue
+            if days < 0:
+                text = f'已逾期 {-days} 天：{row["title"]}'
+            elif days == 0:
+                text = f'今天到期：{row["title"]}'
+            else:
+                text = f'{days} 天后到期：{row["title"]}（{due}）'
+            messages.append(text)
+            self.db.mark_notified(row["id"], today_iso if days < 0 else due)
+        if not messages:
+            return []
+        service = self.tray
+        if service is not None and service.available:
+            for text in messages[:5]:
+                service.notify(APP_NAME, text)
+        summary = "；".join(messages[:3])
+        if len(messages) > 3:
+            summary += f" 等 {len(messages)} 项"
+        self.set_status("提醒：" + summary)
+        self.refresh_plans()
+        return messages
+
+    # ==================================================================
+    # 备份
+    # ==================================================================
+    def _auto_backup(self) -> None:
+        if not self.settings.get("auto_backup", True):
+            return
+        self.run_backup(silent=True)
+
+    def run_backup(self, silent: bool = False) -> None:
+        try:
+            keep = int(self.settings.get("backup_keep", 10))
+        except (TypeError, ValueError):
+            keep = 10
+        try:
+            path = self.db.backup_to(paths.BACKUP_DIR, keep=keep)
+        except (OSError, sqlite3.Error) as exc:
+            if not silent:
+                messagebox.showerror("备份失败", str(exc))
+            return
+        if not silent:
+            self.set_status(f"数据已备份到 {path}")
+            messagebox.showinfo("备份完成", f"数据已备份到：\n{path}\n\n"
+                                            f"共保留最近 {keep} 份。")
+    def open_backup_dir(self) -> None:
+        try:
+            os.makedirs(paths.BACKUP_DIR, exist_ok=True)
+            os.startfile(paths.BACKUP_DIR)
+        except OSError:
+            self.set_status("无法打开备份文件夹")
+
     def card(self, parent: tk.Misc, **kwargs) -> tk.Frame:
         c = self.colors
         return tk.Frame(parent, bg=c["panel"], highlightthickness=1,
@@ -605,6 +737,7 @@ class PlanFlowApp:
         self.nb = ttk.Notebook(body)
         self.nb.pack(fill="both", expand=True)
         self._build_plans_tab(self.nb)
+        self._build_calendar_tab(self.nb)
         self._build_stats_tab(self.nb)
 
     def _build_topbar(self, parent: tk.Frame) -> None:
@@ -641,6 +774,7 @@ class PlanFlowApp:
         c = self.colors
         tab = tk.Frame(nb, bg=c["bg"])
         nb.add(tab, text="  计划管理  ")
+        self.plans_tab = tab
 
         self._build_toolbar(tab)
 
@@ -675,7 +809,10 @@ class PlanFlowApp:
                    command=self.new_plan).pack(side="left")
         ttk.Button(actions, text="删除", command=self.delete_plan).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="标记完成", command=self.mark_done).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="导入 JSON", command=self.import_data).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="导出 JSON", command=self.export_data).pack(side="left", padx=(8, 0))
+        self.trash_btn = ttk.Button(actions, text="回收站", command=self.open_trash)
+        self.trash_btn.pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="最小化到托盘", style="Ghost.TButton",
                    command=self.hide_to_tray).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="刷新", style="Ghost.TButton",
@@ -687,8 +824,8 @@ class PlanFlowApp:
         self.label(filters, "搜索", tone="muted", size=self.font_size - 1).pack(
             side="left", padx=(0, 6))
         self.search_var = tk.StringVar()
-        search = ttk.Entry(filters, textvariable=self.search_var, width=24)
-        search.pack(side="left")
+        self.search_entry = ttk.Entry(filters, textvariable=self.search_var, width=24)
+        self.search_entry.pack(side="left")
 
         self.label(filters, "状态", tone="muted", size=self.font_size - 1).pack(
             side="left", padx=(20, 6))
@@ -712,7 +849,7 @@ class PlanFlowApp:
         self.filter_status.trace_add("write", lambda *_: self.refresh_plans())
         self.filter_category.trace_add("write", lambda *_: self.refresh_plans())
         self.sort_var.trace_add("write", lambda *_: self.refresh_plans())
-        search.bind("<KeyRelease>", lambda _e: self.refresh_plans())
+        self.search_entry.bind("<KeyRelease>", lambda _e: self.refresh_plans())
 
     def _build_plan_list(self, parent: tk.Frame) -> None:
         c = self.colors
@@ -763,7 +900,7 @@ class PlanFlowApp:
         c = self.colors
         parent.columnconfigure(1, weight=1)
         parent.columnconfigure(3, weight=1)
-        parent.rowconfigure(4, weight=1)
+        parent.rowconfigure(5, weight=1)
 
         def field_label(text: str, row: int, col: int, anchor: str = "w") -> None:
             self.label(parent, text, tone="muted", size=self.font_size - 1).grid(
@@ -789,6 +926,8 @@ class PlanFlowApp:
         self.var_priority = tk.StringVar(value="中")
         self.var_status = tk.StringVar(value="未开始")
         self.var_progress = tk.DoubleVar(value=0)
+        self.var_repeat = tk.StringVar(value="不重复")
+        self.var_remind = tk.StringVar(value="不提醒")
 
         field_label("计划标题", 0, 0)
         ttk.Entry(parent, textvariable=self.var_title).grid(
@@ -829,14 +968,22 @@ class PlanFlowApp:
         text_wrap.grid(row=4, column=1, columnspan=3, sticky="nsew", pady=7)
         self.txt_desc = text_area(text_wrap, 6)
 
+        field_label("重复", 5, 0)
+        ttk.Combobox(parent, textvariable=self.var_repeat, values=db.REPEAT_OPTIONS,
+                     width=12, state="readonly").grid(row=5, column=1, sticky="w", pady=7)
+        field_label("到期提醒", 5, 2)
+        ttk.Combobox(parent, textvariable=self.var_remind,
+                     values=[label for label, _ in db.REMIND_CHOICES],
+                     width=12, state="readonly").grid(row=5, column=3, sticky="w", pady=7)
+
         self.meta_var = tk.StringVar()
         self.label(parent, textvariable=self.meta_var, tone="muted",
                    size=self.font_size - 1).grid(
-            row=5, column=0, columnspan=4, sticky="w", pady=(12, 0)
+            row=6, column=0, columnspan=4, sticky="w", pady=(12, 0)
         )
 
         actions = tk.Frame(parent, bg=c["panel"])
-        actions.grid(row=6, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        actions.grid(row=7, column=0, columnspan=4, sticky="w", pady=(12, 0))
         ttk.Button(actions, text="保存修改", style="Accent.TButton",
                    command=self.save_plan).pack(side="left")
         ttk.Button(actions, text="放弃修改", command=self.reload_plan).pack(
@@ -861,26 +1008,54 @@ class PlanFlowApp:
         ttk.Button(row, text="添加子任务", style="Accent.TButton",
                    command=self.add_task).pack(side="left", padx=(8, 0))
 
-        self.label(parent, "双击子任务可切换完成状态；勾选后会按完成比例自动更新总进度。",
-                   tone="muted", size=self.font_size - 1).pack(anchor="w", pady=(12, 8))
+        self.label(
+            parent,
+            "双击可切换完成状态；按住拖动可调整顺序；选中后可设置截止日期与优先级。",
+            tone="muted", size=self.font_size - 1,
+        ).pack(anchor="w", pady=(12, 8))
 
         wrap = tk.Frame(parent, bg=c["panel"])
         wrap.pack(fill="both", expand=True)
-        self.tasks_tree = ttk.Treeview(wrap, columns=("done", "title"),
-                                       show="headings", selectmode="browse")
-        self.tasks_tree.heading("done", text="完成")
-        self.tasks_tree.column("done", width=60, anchor="center", stretch=False)
-        self.tasks_tree.heading("title", text="子任务")
-        self.tasks_tree.column("title", width=380, anchor="w")
+        self.tasks_tree = ttk.Treeview(
+            wrap, columns=("done", "title", "due", "priority"),
+            show="headings", selectmode="browse",
+        )
+        for key, title, width, anchor, stretch in (
+            ("done", "完成", 52, "center", False),
+            ("title", "子任务", 240, "w", True),
+            ("due", "截止日期", 104, "center", False),
+            ("priority", "优先级", 62, "center", False),
+        ):
+            self.tasks_tree.heading(key, text=title)
+            self.tasks_tree.column(key, width=width, anchor=anchor, stretch=stretch)
         self.tasks_tree.tag_configure("odd", background=c["panel"])
         self.tasks_tree.tag_configure("even", background=c["stripe"])
         self.tasks_tree.tag_configure("task_done", foreground=c["done_fg"])
+        self.tasks_tree.tag_configure("task_overdue", foreground=c["danger"])
         scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.tasks_tree.yview)
         self.tasks_tree.configure(yscrollcommand=scroll.set)
         self.tasks_tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.tasks_tree.bind("<Double-1>", lambda _e: self.toggle_task())
         self.tasks_tree.bind("<space>", lambda _e: self.toggle_task())
+        self.tasks_tree.bind("<<TreeviewSelect>>", self._on_task_select)
+        self.tasks_tree.bind("<ButtonPress-1>", self._task_drag_start)
+        self.tasks_tree.bind("<B1-Motion>", self._task_drag_motion)
+        self.tasks_tree.bind("<ButtonRelease-1>", self._task_drag_drop)
+
+        editor = tk.Frame(parent, bg=c["panel"])
+        editor.pack(fill="x", pady=(12, 0))
+        self.label(editor, "截止", tone="muted", size=self.font_size - 1).pack(
+            side="left", padx=(0, 6))
+        self.task_due = CalendarDateEntry(editor, c, width=12)
+        self.task_due.pack(side="left")
+        self.label(editor, "优先级", tone="muted", size=self.font_size - 1).pack(
+            side="left", padx=(14, 6))
+        self.task_priority = tk.StringVar(value="中")
+        ttk.Combobox(editor, textvariable=self.task_priority, values=db.PRIORITIES,
+                     width=8, state="readonly").pack(side="left")
+        ttk.Button(editor, text="保存子任务", command=self.save_task_fields).pack(
+            side="left", padx=(12, 0))
 
         btns = tk.Frame(parent, bg=c["panel"])
         btns.pack(fill="x", pady=(12, 0))
@@ -889,6 +1064,10 @@ class PlanFlowApp:
         ttk.Button(btns, text="清除已完成", command=self.clear_done_tasks).pack(
             side="left", padx=(8, 0)
         )
+        ttk.Button(btns, text="下移", style="Ghost.TButton",
+                   command=lambda: self.move_task(1)).pack(side="right")
+        ttk.Button(btns, text="上移", style="Ghost.TButton",
+                   command=lambda: self.move_task(-1)).pack(side="right", padx=(0, 8))
 
     # ---------------------------------------------------------------- 记录
     def _build_logs_tab(self, parent: tk.Frame) -> None:
@@ -927,6 +1106,201 @@ class PlanFlowApp:
         self.logs_tree.configure(yscrollcommand=scroll.set)
         self.logs_tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+
+    # ==================================================================
+    # 日历页
+    # ==================================================================
+    def _build_calendar_tab(self, nb: ttk.Notebook) -> None:
+        c = self.colors
+        tab = tk.Frame(nb, bg=c["bg"])
+        nb.add(tab, text="  日历  ")
+        self.calendar_tab = tab
+
+        paned = ttk.PanedWindow(tab, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        left = self.card(paned)
+        left_inner = tk.Frame(left, bg=c["panel"])
+        left_inner.pack(fill="both", expand=True, padx=14, pady=14)
+
+        right = self.card(paned)
+        right_inner = tk.Frame(right, bg=c["panel"])
+        right_inner.pack(fill="both", expand=True, padx=14, pady=14)
+
+        paned.add(left, weight=6)
+        paned.add(right, weight=4)
+
+        head = tk.Frame(left_inner, bg=c["panel"])
+        head.pack(fill="x")
+        ttk.Button(head, text="‹", width=3,
+                   command=lambda: self._shift_month(-1)).pack(side="left")
+        self.cal_title = self.label(head, "", bold=True, size=self.font_size + 2)
+        self.cal_title.pack(side="left", padx=12)
+        ttk.Button(head, text="›", width=3,
+                   command=lambda: self._shift_month(1)).pack(side="left")
+        ttk.Button(head, text="今天", style="Ghost.TButton",
+                   command=self._calendar_today).pack(side="right")
+
+        self.cal_summary = tk.StringVar(value="")
+        self.label(left_inner, textvariable=self.cal_summary, tone="muted",
+                   size=self.font_size - 1).pack(anchor="w", pady=(8, 0))
+
+        week = tk.Frame(left_inner, bg=c["panel"])
+        week.pack(fill="x", pady=(10, 0))
+        for index, name in enumerate(("一", "二", "三", "四", "五", "六", "日")):
+            week.columnconfigure(index, weight=1)
+            tk.Label(week, text=name, bg=c["panel"], fg=c["muted"],
+                     font=self.f(self.font_size - 1)).grid(
+                row=0, column=index, sticky="ew")
+
+        self.cal_grid = tk.Frame(left_inner, bg=c["panel"])
+        self.cal_grid.pack(fill="both", expand=True, pady=(4, 0))
+        for index in range(7):
+            self.cal_grid.columnconfigure(index, weight=1, uniform="cal")
+        for index in range(6):
+            self.cal_grid.rowconfigure(index, weight=1, uniform="calrow")
+
+        self.label(right_inner, "当日计划", size=self.font_size + 1, bold=True).pack(
+            anchor="w")
+        self.cal_day_var = tk.StringVar(value="")
+        self.label(right_inner, textvariable=self.cal_day_var, tone="muted",
+                   size=self.font_size - 1).pack(anchor="w", pady=(2, 10))
+
+        wrap = tk.Frame(right_inner, bg=c["panel"])
+        wrap.pack(fill="both", expand=True)
+        self.cal_tree = ttk.Treeview(
+            wrap, columns=("title", "priority", "status", "progress"),
+            show="headings", selectmode="browse",
+        )
+        for key, title, width, anchor in (
+            ("title", "计划", 150, "w"),
+            ("priority", "优先级", 56, "center"),
+            ("status", "状态", 64, "center"),
+            ("progress", "进度", 52, "center"),
+        ):
+            self.cal_tree.heading(key, text=title)
+            self.cal_tree.column(key, width=width, anchor=anchor)
+        self.cal_tree.tag_configure("odd", background=c["panel"])
+        self.cal_tree.tag_configure("even", background=c["stripe"])
+        self.cal_tree.tag_configure("done", foreground=c["done_fg"])
+        bar = ttk.Scrollbar(wrap, orient="vertical", command=self.cal_tree.yview)
+        self.cal_tree.configure(yscrollcommand=bar.set)
+        self.cal_tree.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        self.cal_tree.bind("<Double-1>", self._open_plan_from_calendar)
+
+    def refresh_calendar(self) -> None:
+        if not hasattr(self, "cal_grid"):
+            return
+        self._render_calendar()
+        self._render_calendar_list()
+
+    def _shift_month(self, delta: int) -> None:
+        month = self._cal_month + delta
+        year = self._cal_year + (month - 1) // 12
+        self._cal_year = year
+        self._cal_month = (month - 1) % 12 + 1
+        self._render_calendar()
+
+    def _calendar_today(self) -> None:
+        today = date.today()
+        self._cal_year, self._cal_month = today.year, today.month
+        self._cal_selected = today.isoformat()
+        self._render_calendar()
+        self._render_calendar_list()
+
+    def _select_calendar_day(self, day: str) -> None:
+        self._cal_selected = day
+        self._render_calendar()
+        self._render_calendar_list()
+
+    def _render_calendar(self) -> None:
+        c = self.colors
+        for child in self.cal_grid.winfo_children():
+            child.destroy()
+        self.cal_title.configure(text=f"{self._cal_year} 年 {self._cal_month} 月")
+
+        first = date(self._cal_year, self._cal_month, 1)
+        last = date(self._cal_year, self._cal_month,
+                    calendar.monthrange(self._cal_year, self._cal_month)[1])
+        counts = self.db.due_counts(first.isoformat(), last.isoformat())
+        today = date.today().isoformat()
+
+        weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(
+            self._cal_year, self._cal_month)
+        for row, week in enumerate(weeks[:6]):
+            for col, day in enumerate(week):
+                if day.month != self._cal_month:
+                    continue
+                iso = day.isoformat()
+                count = counts.get(iso, 0)
+                selected = iso == self._cal_selected
+                is_today = iso == today
+                if selected:
+                    bg, fg = c["accent"], c["accent_fg"]
+                elif count:
+                    bg, fg = c["accent_soft"], c["text"]
+                else:
+                    bg, fg = c["panel_alt"], c["text"]
+
+                cell = tk.Frame(
+                    self.cal_grid, bg=bg, highlightthickness=1,
+                    highlightbackground=c["accent"] if is_today else c["border"],
+                    cursor="hand2",
+                )
+                cell.grid(row=row, column=col, sticky="nsew", padx=2, pady=2)
+                number = tk.Label(cell, text=str(day.day), bg=bg, fg=fg,
+                                  font=self.f(self.font_size, bold=is_today))
+                number.pack(anchor="nw", padx=6, pady=(4, 0))
+                widgets = [cell, number]
+                if count:
+                    badge = tk.Label(cell, text=f"{count} 项", bg=bg,
+                                     fg=fg if selected else c["accent"],
+                                     font=self.f(max(self.font_size - 2, 8)))
+                    badge.pack(anchor="w", padx=6)
+                    widgets.append(badge)
+                for widget in widgets:
+                    widget.bind("<Button-1>",
+                                lambda _e, d=iso: self._select_calendar_day(d))
+
+        month_total = sum(counts.values())
+        self.cal_summary.set(
+            f"本月共 {month_total} 项到期计划 · 点击日期查看当天计划")
+
+    def _render_calendar_list(self) -> None:
+        for iid in self.cal_tree.get_children():
+            self.cal_tree.delete(iid)
+        rows = self.db.plans_due_on(self._cal_selected)
+        try:
+            pretty = date.fromisoformat(self._cal_selected).strftime("%Y-%m-%d")
+        except ValueError:
+            pretty = self._cal_selected
+        self.cal_day_var.set(f"{pretty} · 共 {len(rows)} 项 · 双击可在计划管理中打开")
+        for index, row in enumerate(rows):
+            tags = ["even" if index % 2 else "odd"]
+            if row["status"] == "已完成":
+                tags.append("done")
+            self.cal_tree.insert(
+                "", "end", iid=str(row["id"]),
+                values=(row["title"], row["priority"], row["status"],
+                        f'{row["progress"]}%'),
+                tags=tuple(tags),
+            )
+
+    def _open_plan_from_calendar(self, _event=None) -> None:
+        selection = self.cal_tree.selection()
+        if not selection:
+            return
+        plan_id = int(selection[0])
+        self.nb.select(self.plans_tab)
+        if not self.tree.exists(str(plan_id)):
+            self.search_var.set("")
+            self.filter_status.set("全部")
+            self.filter_category.set("全部")
+            self.refresh_plans()
+        if self.tree.exists(str(plan_id)):
+            self.tree.selection_set(str(plan_id))
+            self.tree.see(str(plan_id))
 
     # ==================================================================
     # 统计页
@@ -1025,6 +1399,11 @@ class PlanFlowApp:
         self.refresh_categories()
         self.refresh_plans()
         self.refresh_stats()
+        self.refresh_calendar()
+
+    def _update_trash_button(self) -> None:
+        count = self.db.trash_count()
+        self.trash_btn.configure(text=f"回收站 ({count})" if count else "回收站")
 
     def refresh_categories(self) -> None:
         categories = self.db.list_categories()
@@ -1121,6 +1500,7 @@ class PlanFlowApp:
                 values=(row["created_at"], row["plan_title"] or "—", text),
                 tags=("even" if index % 2 else "odd",),
             )
+        self._update_trash_button()
 
     # ==================================================================
     # 计划操作
@@ -1142,6 +1522,8 @@ class PlanFlowApp:
         self.var_status.set(plan["status"])
         self.var_progress.set(plan["progress"])
         self._on_progress()
+        self.var_repeat.set(plan["repeat_rule"] or "不重复")
+        self.var_remind.set(db.remind_label(plan["remind_days"]))
         self.dp_start.set(plan["start_date"])
         self.dp_due.set(plan["due_date"])
         self.txt_desc.delete("1.0", "end")
@@ -1165,6 +1547,8 @@ class PlanFlowApp:
         self.var_status.set("未开始")
         self.var_progress.set(0)
         self._on_progress()
+        self.var_repeat.set("不重复")
+        self.var_remind.set("不提醒")
         self.dp_start.set("")
         self.dp_due.set("")
         self.txt_desc.delete("1.0", "end")
@@ -1201,23 +1585,59 @@ class PlanFlowApp:
         if self.current_plan_id is None:
             self.set_status("请先选择或新建一个计划")
             return
+        plan_id = self.current_plan_id
+        before = self.db.get_plan(plan_id)
         title = self.var_title.get().strip() or "未命名计划"
-        self.db.update_plan(
-            self.current_plan_id,
-            title=title,
-            description=self.txt_desc.get("1.0", "end").strip(),
-            category=self.var_category.get().strip() or "默认",
-            priority=self.var_priority.get(),
-            status=self.var_status.get(),
-            start_date=self.dp_start.get() or None,
-            due_date=self.dp_due.get() or None,
-            progress=int(round(self.var_progress.get())),
-        )
+        due_date = self.dp_due.get() or None
+        fields = {
+            "title": title,
+            "description": self.txt_desc.get("1.0", "end").strip(),
+            "category": self.var_category.get().strip() or "默认",
+            "priority": self.var_priority.get(),
+            "status": self.var_status.get(),
+            "start_date": self.dp_start.get() or None,
+            "due_date": due_date,
+            "progress": int(round(self.var_progress.get())),
+            "repeat_rule": self.var_repeat.get() or "不重复",
+            "remind_days": db.REMIND_LABEL_TO_VALUE.get(self.var_remind.get(), -1),
+        }
+        if before is not None and (before["due_date"] or None) != due_date:
+            fields["notified_at"] = None
+        self.db.update_plan(plan_id, **fields)
         self.refresh_categories()
-        self._update_row(self.current_plan_id)
+        self._update_row(plan_id)
         self.refresh_stats()
-        self.load_plan(self.current_plan_id)
+        self.load_plan(plan_id)
         self.set_status(f'已保存「{title}」')
+        self._after_completed(plan_id, before)
+
+    def _after_completed(self, plan_id: int, before=None) -> None:
+        """计划被标记为已完成时，按重复规则生成下一期。"""
+        if self._repeat_guard:
+            return
+        plan = self.db.get_plan(plan_id)
+        if plan is None or plan["status"] != "已完成":
+            return
+        if before is not None and before["status"] == "已完成":
+            return
+        if not self.settings.get("auto_repeat", True):
+            return
+        if (plan["repeat_rule"] or "不重复") == "不重复" or not plan["due_date"]:
+            return
+        next_due = db.shift_date(plan["due_date"], plan["repeat_rule"])
+        if next_due is None:
+            return
+        self._repeat_guard = True
+        try:
+            new_id = self.db.repeat_plan(plan_id, next_due)
+        finally:
+            self._repeat_guard = False
+        if new_id is None:
+            return
+        self.refresh_all()
+        self.set_status(
+            f'已生成下一期「{plan["title"]}」，截止 {next_due}'
+        )
 
     def delete_plan(self) -> None:
         if self.current_plan_id is None:
@@ -1227,26 +1647,56 @@ class PlanFlowApp:
         if plan is None:
             return
         if self.settings.get("confirm_delete") and not messagebox.askyesno(
-            "删除计划", f'确定删除「{plan["title"]}」及其子任务和记录吗？此操作不可撤销。'
+            "删除计划",
+            f'确定把「{plan["title"]}」及其子任务和记录移入回收站吗？\n'
+            f"移入后可用 Ctrl+Z 或「回收站」恢复。",
         ):
             return
         plan_id = self.current_plan_id
         self.current_plan_id = None
-        self.db.delete_plan(plan_id)
+        self.db.trash_plan(plan_id)
+        self._undo_plan_id = plan_id
         self.refresh_categories()
         self.refresh_plans()
         self.refresh_stats()
-        self.set_status("计划已删除")
+        self.refresh_calendar()
+        self.set_status("已移入回收站 · Ctrl+Z 可撤销")
+
+    def undo_delete(self) -> None:
+        """恢复最近一次移入回收站的计划。"""
+        plan_id = self._undo_plan_id
+        plan = self.db.get_plan(plan_id) if plan_id is not None else None
+        if plan is None or plan["deleted_at"] is None:
+            latest = self.db.last_trashed()
+            if latest is None:
+                self.set_status("回收站是空的，没有可撤销的删除")
+                return
+            plan_id = int(latest["id"])
+        self.db.restore_plan(plan_id)
+        self._undo_plan_id = None
+        self.refresh_categories()
+        self.refresh_plans()
+        self.refresh_stats()
+        self.refresh_calendar()
+        restored = self.db.get_plan(plan_id)
+        if restored is not None and self.tree.exists(str(plan_id)):
+            self.tree.selection_set(str(plan_id))
+            self.tree.see(str(plan_id))
+        self.set_status(f'已恢复「{(restored or plan)["title"]}」')
 
     def mark_done(self) -> None:
         if self.current_plan_id is None:
             self.set_status("请先选择一个计划")
             return
-        self.db.update_plan(self.current_plan_id, status="已完成", progress=100)
-        self._update_row(self.current_plan_id)
+        plan_id = self.current_plan_id
+        before = self.db.get_plan(plan_id)
+        self.db.update_plan(plan_id, status="已完成", progress=100)
+        self._update_row(plan_id)
         self.refresh_stats()
-        self.load_plan(self.current_plan_id)
+        self.load_plan(plan_id)
+        self.refresh_calendar()
         self.set_status("已标记为完成")
+        self._after_completed(plan_id, before)
 
     def export_data(self) -> None:
         default = f'blueprint_export_{datetime.now():%Y%m%d_%H%M}.json'
@@ -1265,6 +1715,32 @@ class PlanFlowApp:
         self.set_status(f"已导出 {count} 条计划到 {path}")
         messagebox.showinfo("导出完成", f"已导出 {count} 条计划：\n{path}")
 
+    def import_data(self) -> None:
+        path = filedialog.askopenfilename(
+            title="导入数据", initialdir=paths.EXPORT_DIR,
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            count = self.db.import_json(path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("导入失败", f"无法读取该文件：\n{exc}")
+            return
+        self.refresh_all()
+        self.refresh_calendar()
+        messagebox.showinfo("导入完成", f"已导入 {count} 条计划。")
+
+    # ------------------------------------------------------------------
+    # 回收站
+    # ------------------------------------------------------------------
+    def open_trash(self) -> None:
+        if self.trash_dialog is not None and self.trash_dialog.winfo_exists():
+            self.trash_dialog.lift()
+            self.trash_dialog.focus_set()
+            return
+        self.trash_dialog = TrashDialog(self)
+
     # ==================================================================
     # 子任务操作
     # ==================================================================
@@ -1272,18 +1748,91 @@ class PlanFlowApp:
         for iid in self.tasks_tree.get_children():
             self.tasks_tree.delete(iid)
         if self.current_plan_id is None:
+            self.detail_nb.tab(self.tab_tasks, text="子任务 (0)")
             return
         tasks = self.db.tasks_for(self.current_plan_id)
+        today = date.today().isoformat()
         for index, task in enumerate(tasks):
             tags = ["even" if index % 2 else "odd"]
             if task["done"]:
                 tags.append("task_done")
+            elif task["due_date"] and task["due_date"] < today:
+                tags.append("task_overdue")
             self.tasks_tree.insert(
                 "", "end", iid=str(task["id"]),
-                values=("✔" if task["done"] else "○", task["title"]),
+                values=("✔" if task["done"] else "○", task["title"],
+                        task["due_date"] or "—", task["priority"] or "中"),
                 tags=tuple(tags),
             )
         self.detail_nb.tab(self.tab_tasks, text=f"子任务 ({len(tasks)})")
+        self._on_task_select()
+
+    def _on_task_select(self, _event=None) -> None:
+        task_id = self._selected_task_id()
+        task = self.db.task(task_id) if task_id is not None else None
+        if task is None:
+            self.task_due.set("")
+            self.task_priority.set("中")
+            return
+        self.task_due.set(task["due_date"] or "")
+        self.task_priority.set(task["priority"] or "中")
+
+    def save_task_fields(self) -> None:
+        task_id = self._selected_task_id()
+        if task_id is None:
+            self.set_status("请先选择一个子任务")
+            return
+        self.db.update_task(
+            task_id,
+            due_date=self.task_due.get() or None,
+            priority=self.task_priority.get() or "中",
+        )
+        self.refresh_tasks()
+        if self.tasks_tree.exists(str(task_id)):
+            self.tasks_tree.selection_set(str(task_id))
+        self.set_status("子任务已更新")
+
+    def move_task(self, offset: int) -> None:
+        task_id = self._selected_task_id()
+        if task_id is None:
+            self.set_status("请先选择一个子任务")
+            return
+        if not self.db.move_task(task_id, offset):
+            return
+        self.refresh_tasks()
+        if self.tasks_tree.exists(str(task_id)):
+            self.tasks_tree.selection_set(str(task_id))
+            self.tasks_tree.see(str(task_id))
+
+    # ---------------------------------------------------------------- 拖拽排序
+    def _task_drag_start(self, event) -> None:
+        iid = self.tasks_tree.identify_row(event.y)
+        self._drag_task_id = int(iid) if iid else None
+
+    def _task_drag_motion(self, event) -> None:
+        if getattr(self, "_drag_task_id", None) is None:
+            return
+        target = self.tasks_tree.identify_row(event.y)
+        if target and target != str(self._drag_task_id):
+            self.tasks_tree.selection_set(target)
+
+    def _task_drag_drop(self, event) -> None:
+        drag_id = getattr(self, "_drag_task_id", None)
+        self._drag_task_id = None
+        if drag_id is None or self.current_plan_id is None:
+            return
+        target = self.tasks_tree.identify_row(event.y)
+        if not target or target == str(drag_id):
+            return
+        order = list(self.tasks_tree.get_children())
+        if str(drag_id) not in order or target not in order:
+            return
+        order.remove(str(drag_id))
+        order.insert(order.index(target), str(drag_id))
+        self.db.reorder_tasks(self.current_plan_id, [int(x) for x in order])
+        self.refresh_tasks()
+        if self.tasks_tree.exists(str(drag_id)):
+            self.tasks_tree.selection_set(str(drag_id))
 
     def add_task(self) -> None:
         title = self.new_task_var.get().strip()
@@ -1421,6 +1970,11 @@ class SettingsDialog(tk.Toplevel):
             "close_to_tray": tk.BooleanVar(value=bool(app.settings.get("close_to_tray"))),
             "hotkey_enabled": tk.BooleanVar(value=bool(app.settings.get("hotkey_enabled"))),
             "start_with_windows": tk.BooleanVar(value=startup.is_enabled()),
+            "reminder_enabled": tk.BooleanVar(
+                value=bool(app.settings.get("reminder_enabled"))),
+            "auto_repeat": tk.BooleanVar(value=bool(app.settings.get("auto_repeat"))),
+            "auto_backup": tk.BooleanVar(value=bool(app.settings.get("auto_backup"))),
+            "backup_keep": tk.StringVar(value=str(app.settings.get("backup_keep"))),
         }
 
         self.title("设置")
@@ -1502,7 +2056,7 @@ class SettingsDialog(tk.Toplevel):
         # ----- 功能 -----
         options = self._section(body, "功能")
         for key, title in (
-            ("confirm_delete", "删除计划前二次确认"),
+            ("confirm_delete", "删除计划前二次确认（删除后进入回收站）"),
             ("auto_sync_progress", "子任务完成时自动同步总进度"),
             ("highlight_due", "高亮显示逾期与今日到期的计划"),
             ("remember_geometry", "记住窗口大小与位置"),
@@ -1510,14 +2064,37 @@ class SettingsDialog(tk.Toplevel):
             ttk.Checkbutton(options, text=title,
                             variable=self._vars[key]).pack(anchor="w")
 
-        combo_row = tk.Frame(options, bg=c["panel"])
+        # ----- 提醒与计划 -----
+        extra = self._section(body, "提醒与计划")
+        for key, title in (
+            ("reminder_enabled", "计划到期时弹出托盘提醒"),
+            ("auto_repeat", "重复计划完成后自动生成下一期"),
+            ("auto_backup", "每次启动时自动备份数据"),
+        ):
+            ttk.Checkbutton(extra, text=title,
+                            variable=self._vars[key]).pack(anchor="w")
+
+        backup_row = tk.Frame(extra, bg=c["panel"])
+        backup_row.pack(fill="x", pady=(10, 0))
+        tk.Label(backup_row, text="备份保留", bg=c["panel"], fg=c["muted"],
+                 font=f(10), width=10, anchor="w").pack(side="left")
+        ttk.Combobox(backup_row, textvariable=self._vars["backup_keep"],
+                     values=[str(value) for value in BACKUP_KEEP_CHOICES],
+                     width=12, state="readonly").pack(side="left")
+        ttk.Button(backup_row, text="立即备份", style="Ghost.TButton",
+                   command=lambda: self.app.run_backup(silent=False)).pack(
+            side="left", padx=(12, 0))
+        ttk.Button(backup_row, text="打开备份文件夹", style="Ghost.TButton",
+                   command=self.app.open_backup_dir).pack(side="left", padx=(8, 0))
+
+        combo_row = tk.Frame(extra, bg=c["panel"])
         combo_row.pack(fill="x", pady=(12, 0))
         tk.Label(combo_row, text="默认排序", bg=c["panel"], fg=c["muted"],
                  font=f(10), width=10, anchor="w").pack(side="left")
         ttk.Combobox(combo_row, textvariable=self._vars["default_order"],
                      values=db.ORDER_OPTIONS, width=12, state="readonly").pack(side="left")
 
-        font_row = tk.Frame(options, bg=c["panel"])
+        font_row = tk.Frame(extra, bg=c["panel"])
         font_row.pack(fill="x", pady=(10, 0))
         tk.Label(font_row, text="界面字号", bg=c["panel"], fg=c["muted"],
                  font=f(10), width=10, anchor="w").pack(side="left")
@@ -1629,6 +2206,10 @@ class SettingsDialog(tk.Toplevel):
         }
         self.app.settings.update(values)
         self.app.settings.set("font_size", int(self._vars["font_size"].get()))
+        try:
+            self.app.settings.set("backup_keep", int(self._vars["backup_keep"].get()))
+        except (TypeError, ValueError):
+            pass
         self.app.settings.save()
         self._apply_startup()
         self.app.apply_settings()
@@ -1650,11 +2231,147 @@ class SettingsDialog(tk.Toplevel):
             pass
 
 
+class TrashDialog(tk.Toplevel):
+    """回收站：恢复或彻底删除已移入回收站的计划。"""
+
+    def __init__(self, app: PlanFlowApp) -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.title("回收站")
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda _e: self._close())
+        self._build()
+        self.refresh()
+        self._place()
+
+    def _build(self) -> None:
+        c = self.app.colors
+        f = self.app.f
+
+        header = tk.Frame(self, bg=c["topbar"])
+        header.pack(fill="x")
+        tk.Label(header, text="回收站", bg=c["topbar"], fg=c["text"],
+                 font=f(13, bold=True)).pack(side="left", padx=22, pady=14)
+        tk.Label(header, text="可以恢复或彻底删除", bg=c["topbar"], fg=c["muted"],
+                 font=f(9)).pack(side="left", pady=16)
+        tk.Frame(self, bg=c["border"], height=1).pack(fill="x")
+
+        body = tk.Frame(self, bg=c["panel"])
+        body.pack(fill="both", expand=True, padx=22, pady=16)
+
+        wrap = tk.Frame(body, bg=c["panel"])
+        wrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            wrap, columns=("title", "category", "tasks", "deleted"),
+            show="headings", selectmode="browse", height=12,
+        )
+        for key, title, width, anchor in (
+            ("title", "计划", 180, "w"),
+            ("category", "分类", 80, "center"),
+            ("tasks", "子任务", 64, "center"),
+            ("deleted", "移入时间", 150, "center"),
+        ):
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, anchor=anchor)
+        self.tree.tag_configure("odd", background=c["panel"])
+        self.tree.tag_configure("even", background=c["stripe"])
+        bar = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=bar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        self.tree.bind("<Double-1>", lambda _e: self.restore())
+
+        self.info_var = tk.StringVar(value="")
+        tk.Label(body, textvariable=self.info_var, bg=c["panel"], fg=c["muted"],
+                 font=f(9), anchor="w").pack(fill="x", pady=(10, 0))
+
+        footer = tk.Frame(body, bg=c["panel"])
+        footer.pack(fill="x", pady=(12, 0))
+        ttk.Button(footer, text="恢复选中", style="Accent.TButton",
+                   command=self.restore).pack(side="left")
+        ttk.Button(footer, text="彻底删除", command=self.purge).pack(
+            side="left", padx=(8, 0))
+        ttk.Button(footer, text="清空回收站", style="Ghost.TButton",
+                   command=self.empty).pack(side="left", padx=(8, 0))
+        ttk.Button(footer, text="关闭", command=self._close).pack(side="right")
+
+    def refresh(self) -> None:
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        rows = self.app.db.list_trash()
+        for index, row in enumerate(rows):
+            self.tree.insert(
+                "", "end", iid=str(row["id"]),
+                values=(row["title"], row["category"], row["task_count"],
+                        row["deleted_at"] or ""),
+                tags=("even" if index % 2 else "odd",),
+            )
+        self.info_var.set(
+            f"共 {len(rows)} 项。双击可恢复。" if rows else "回收站是空的。")
+        self.app.refresh_all()
+
+    def _selected(self) -> int | None:
+        selection = self.tree.selection()
+        return int(selection[0]) if selection else None
+
+    def restore(self) -> None:
+        plan_id = self._selected()
+        if plan_id is None:
+            self.app.set_status("请先选择要恢复的计划")
+            return
+        self.app.db.restore_plan(plan_id)
+        self.app.set_status("已从回收站恢复计划")
+        self.refresh()
+
+    def purge(self) -> None:
+        plan_id = self._selected()
+        if plan_id is None:
+            self.app.set_status("请先选择要删除的计划")
+            return
+        if not messagebox.askyesno(
+            "彻底删除", "彻底删除后无法恢复，确定继续吗？", parent=self
+        ):
+            return
+        self.app.db.purge_plan(plan_id)
+        self.app.set_status("已彻底删除")
+        self.refresh()
+
+    def empty(self) -> None:
+        if self.app.db.trash_count() == 0:
+            self.app.set_status("回收站已经是空的")
+            return
+        if not messagebox.askyesno(
+            "清空回收站", "将彻底删除回收站中的全部计划，且无法恢复。\n确定继续吗？",
+            parent=self,
+        ):
+            return
+        count = self.app.db.empty_trash()
+        self.app.set_status(f"已清空回收站（{count} 项）")
+        self.refresh()
+
+    def _place(self) -> None:
+        self.update_idletasks()
+        width = max(self.winfo_reqwidth(), 660)
+        height = max(self.winfo_reqheight(), 460)
+        root = self.app.root
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - width) // 2)
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - height) // 3)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _close(self) -> None:
+        self.app.trash_dialog = None
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
 def _wake_existing_instance(timeout: float = 15.0) -> bool:
     """请求已运行的实例把主窗口显示出来。
 
-    已有实例刚启动时（开机自启、打包版解包期间）托盘窗口可能尚未建立，
-    此时一次性唤醒会被丢弃，所以这里带重试。
+    已有实例刚启动时（开机自启、打包版解包期间）托盘图标尚未就绪，
+    此时唤醒会被丢弃，所以这里带重试。
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -1676,8 +2393,8 @@ def main(start_hidden: bool = False) -> None:
     root = tk.Tk()
     app = PlanFlowApp(root, start_hidden=start_hidden)
     app.status_var.set(
-        f"就绪 · Ctrl+N 新建，Ctrl+S 保存，F5 刷新，Ctrl+, 设置，"
-        f"{tray_mod.HOTKEY_LABEL} 呼出/收起"
+        f"就绪 · Ctrl+N 新建，Ctrl+S 保存，Ctrl+Z 撤销删除，F5 刷新，"
+        f"Ctrl+F 搜索，Ctrl+, 设置，{tray_mod.HOTKEY_LABEL} 呼出/收起"
     )
     try:
         root.mainloop()

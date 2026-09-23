@@ -24,6 +24,7 @@ DB_NAME = "planflow.db"
 SETTINGS_NAME = "settings.json"
 LOG_NAME = "blueprint.log"
 EXPORT_DIR_NAME = "导出"
+BACKUP_DIR_NAME = "备份"
 
 
 def app_dir() -> str:
@@ -76,6 +77,7 @@ DB_PATH = os.path.join(CONFIG_DIR, DB_NAME)
 SETTINGS_PATH = os.path.join(CONFIG_DIR, SETTINGS_NAME)
 LOG_PATH = os.path.join(CONFIG_DIR, LOG_NAME)
 EXPORT_DIR = os.path.join(CONFIG_DIR, EXPORT_DIR_NAME)
+BACKUP_DIR = os.path.join(CONFIG_DIR, BACKUP_DIR_NAME)
 
 ICON_PATH = os.path.join(RESOURCE_DIR, "blueprint.ico")
 ICONS_DIR = os.path.join(RESOURCE_DIR, "icons")
